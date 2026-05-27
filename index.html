@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Phone GPS &rarr; ESP32</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0b0f14; color: #e6edf3;
+         display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 28px 18px; }
+  h1 { font-size: 20px; margin: 4px 0 0; }
+  button { font-size: 17px; padding: 14px 22px; border: 0; border-radius: 12px;
+           background: #2f81f7; color: #fff; font-weight: 600; }
+  button:disabled { background: #30363d; color: #8b949e; }
+  #stop { background: #b62324; }
+  .grid { width: 100%; max-width: 420px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 12px 14px; }
+  .card .k { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 22px; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  #status { font-size: 14px; color: #8b949e; min-height: 20px; text-align: center; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: #b62324; }
+  .dot.on { background: #2ea043; }
+</style>
+</head>
+<body>
+  <h1>Phone GPS &rarr; ESP32</h1>
+  <button id="connect">Connect to ESP32-GPS</button>
+  <button id="stop" hidden>Disconnect</button>
+  <div id="status"><span class="dot" id="dot"></span><span id="statusText">Not connected. Tap Connect (Android Chrome).</span></div>
+
+  <div class="grid">
+    <div class="card"><div class="k">Speed</div><div class="v"><span id="speed">--</span> km/h</div></div>
+    <div class="card"><div class="k">Heading</div><div class="v"><span id="heading">--</span>&deg;</div></div>
+    <div class="card"><div class="k">Latitude</div><div class="v" id="lat">--</div></div>
+    <div class="card"><div class="k">Longitude</div><div class="v" id="lon">--</div></div>
+    <div class="card"><div class="k">Accuracy</div><div class="v">&plusmn;<span id="acc">--</span> m</div></div>
+    <div class="card"><div class="k">Sent</div><div class="v" id="sent">0</div></div>
+  </div>
+
+<script>
+const SERVICE_UUID = 0xffe0;
+const CHAR_UUID    = 0xffe1;
+
+let characteristic = null;
+let watchId = null;
+let sentCount = 0;
+
+const $ = id => document.getElementById(id);
+function setStatus(text, ok=false) { $('statusText').textContent = text; $('dot').classList.toggle('on', ok); }
+
+async function connect() {
+  if (!navigator.bluetooth) { setStatus('Web Bluetooth unavailable. Use Android Chrome over HTTPS.'); return; }
+  if (!navigator.geolocation) { setStatus('Geolocation unavailable on this browser.'); return; }
+  try {
+    setStatus('Choosing device...');
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    setStatus('Connecting...');
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    characteristic = await service.getCharacteristic(CHAR_UUID);
+
+    $('connect').hidden = true;
+    $('stop').hidden = false;
+    setStatus('Connected. Acquiring GPS...', true);
+
+    watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, {
+      enableHighAccuracy: true, maximumAge: 0, timeout: 15000
+    });
+  } catch (e) {
+    setStatus('Connect failed: ' + e.message);
+  }
+}
+
+async function onPosition(pos) {
+  const c = pos.coords;
+  const speed   = (c.speed   == null || isNaN(c.speed))   ? 0  : c.speed;     // m/s
+  const heading = (c.heading == null || isNaN(c.heading)) ? -1 : c.heading;   // deg
+  const acc     = c.accuracy || 0;
+
+  $('lat').textContent = c.latitude.toFixed(5);
+  $('lon').textContent = c.longitude.toFixed(5);
+  $('speed').textContent = (speed * 3.6).toFixed(0);
+  $('heading').textContent = heading < 0 ? '--' : heading.toFixed(0);
+  $('acc').textContent = acc.toFixed(0);
+  setStatus('Streaming GPS to ESP32', true);
+
+  if (!characteristic) return;
+  const payload = `${c.latitude.toFixed(6)},${c.longitude.toFixed(6)},${speed.toFixed(2)},${heading.toFixed(1)},${acc.toFixed(1)}`;
+  try {
+    // writeValueWithoutResponse is fast and fine for a stream of fixes.
+    await characteristic.writeValueWithoutResponse(new TextEncoder().encode(payload));
+    $('sent').textContent = ++sentCount;
+  } catch (e) {
+    setStatus('Write failed: ' + e.message);
+  }
+}
+
+function onGeoError(e) { setStatus('GPS error: ' + e.message); }
+
+function onDisconnected() {
+  characteristic = null;
+  if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  $('connect').hidden = false;
+  $('stop').hidden = true;
+  setStatus('Disconnected.');
+}
+
+$('connect').addEventListener('click', connect);
+$('stop').addEventListener('click', () => onDisconnected());
+</script>
+</body>
+</html>
