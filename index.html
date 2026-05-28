@@ -174,7 +174,11 @@ async function go() {
   $('route-dest').textContent = dest.name.split(',').slice(0, 2).join(',');
   $('route-dist').textContent = (r.distance / 1000).toFixed(1) + ' km';
   $('route-eta').textContent  = Math.round(r.duration / 60) + ' min';
-  setStatus(navChar ? 'Route loaded. Streaming nav to ESP32.' : 'Route loaded (no nav char on board - flash firmware v2).', true);
+  setStatus(navChar ? 'Route loaded. Uploading polyline...' : 'Route loaded (no nav char on board - flash firmware v2).', true);
+
+  // Upload route polyline to firmware (for the MAP view). Fire and forget;
+  // status updates from inside the function. Errors are non-fatal.
+  if (navChar && r.geometry) sendPolyline(r.geometry).catch(()=>{});
 
   ensureWatching();
 }
@@ -184,6 +188,90 @@ function clearRoute() {
   $('route-card').hidden  = true;
   $('clear-route').hidden = true;
   $('route-next').textContent = '—';
+}
+
+// ---------- polyline upload (route shape -> ESP32 map view) ----------
+// Decode Google encoded polyline (precision 1e5) -> array of [lat, lon].
+function decodePolyline(str) {
+  let index = 0, lat = 0, lng = 0;
+  const out = [];
+  while (index < str.length) {
+    let b, shift = 0, result = 0;
+    do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+    shift = 0; result = 0;
+    do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+    out.push([lat / 1e5, lng / 1e5]);
+  }
+  return out;
+}
+
+// Evenly downsample to N points (keeps start and end).
+function downsamplePoints(points, target) {
+  if (points.length <= target) return points;
+  const out = [];
+  for (let i = 0; i < target; i++) {
+    const idx = Math.round(i * (points.length - 1) / (target - 1));
+    out.push(points[idx]);
+  }
+  return out;
+}
+
+// Send a polyline to firmware (via 0xFFE2 meta frames with leading 0xFF byte).
+async function sendPolyline(polylineStr) {
+  if (!navChar) return;
+  const raw = decodePolyline(polylineStr);
+  const pts = downsamplePoints(raw, 100);   // firmware caps at 128
+
+  let laMin = pts[0][0], laMax = pts[0][0], loMin = pts[0][1], loMax = pts[0][1];
+  for (const [la, lo] of pts) {
+    if (la < laMin) laMin = la; if (la > laMax) laMax = la;
+    if (lo < loMin) loMin = lo; if (lo > loMax) loMax = lo;
+  }
+
+  // BEGIN frame: 0xFF 0x00, u16 count, u16 reserved, 4 x i32 bbox (* 1e6)
+  const begin = new ArrayBuffer(22);
+  const bd = new DataView(begin);
+  bd.setUint8(0, 0xFF); bd.setUint8(1, 0x00);
+  bd.setUint16(2, pts.length, true);
+  bd.setUint16(4, 0, true);
+  bd.setInt32(6,  Math.round(laMin * 1e6), true);
+  bd.setInt32(10, Math.round(laMax * 1e6), true);
+  bd.setInt32(14, Math.round(loMin * 1e6), true);
+  bd.setInt32(18, Math.round(loMax * 1e6), true);
+
+  // Serialize through the same write queue used by GPS/nav, otherwise
+  // Android Web Bluetooth happily races and throws "GATT operation failed".
+  while (writeBusy) await new Promise(r => setTimeout(r, 30));
+  writeBusy = true;
+  try {
+    await navChar.writeValueWithoutResponse(new Uint8Array(begin));
+    await new Promise(r => setTimeout(r, 40));
+
+    // POINTS frames: 0xFF 0x01, u8 count, then count*(i32 lat, i32 lon)
+    const BATCH = 12;                       // 12 * 8 + 3 = 99 bytes per frame
+    for (let i = 0; i < pts.length; i += BATCH) {
+      const count = Math.min(BATCH, pts.length - i);
+      const buf = new ArrayBuffer(3 + count * 8);
+      const dv  = new DataView(buf);
+      dv.setUint8(0, 0xFF); dv.setUint8(1, 0x01); dv.setUint8(2, count);
+      for (let j = 0; j < count; j++) {
+        const [la, lo] = pts[i + j];
+        dv.setInt32(3 + j * 8,     Math.round(la * 1e6), true);
+        dv.setInt32(3 + j * 8 + 4, Math.round(lo * 1e6), true);
+      }
+      await navChar.writeValueWithoutResponse(new Uint8Array(buf));
+      await new Promise(r => setTimeout(r, 35));
+    }
+
+    await navChar.writeValueWithoutResponse(new Uint8Array([0xFF, 0x02]));   // END
+    setStatus(`Map sent (${pts.length} pts). Press BOOT on the board to see it.`, true);
+  } catch (e) {
+    setStatus('Polyline upload failed: ' + e.message);
+  } finally {
+    writeBusy = false;
+  }
 }
 
 // ---------- helpers ----------
