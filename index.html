@@ -234,7 +234,15 @@ function ensureWatching() {
     { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
 }
 
-function onPosition(pos) {
+// Throttle: don't pile up writes on the BLE stack. Android Web Bluetooth
+// can return "GATT operation failed" when two writes are kicked off in the
+// same tick (one per characteristic) without awaiting. We serialize with
+// await and rate-limit the nav write.
+const NAV_MIN_INTERVAL_MS = 800;
+let lastNavWrite = 0;
+let writeBusy = false;
+
+async function onPosition(pos) {
   const c       = pos.coords;
   const speed   = (c.speed   == null || isNaN(c.speed))   ? 0  : c.speed;
   const heading = (c.heading == null || isNaN(c.heading)) ? -1 : c.heading;
@@ -246,40 +254,57 @@ function onPosition(pos) {
   $('heading').textContent = heading < 0 ? '--' : heading.toFixed(0);
   $('acc').textContent     = acc.toFixed(0);
 
-  // 1) stream raw GPS (existing char)
-  if (gpsChar) {
-    const payload = `${c.latitude.toFixed(6)},${c.longitude.toFixed(6)},${speed.toFixed(2)},${heading.toFixed(1)},${acc.toFixed(1)}`;
-    gpsChar.writeValueWithoutResponse(new TextEncoder().encode(payload))
-           .then(() => $('sent').textContent = ++sentCount)
-           .catch(e => setStatus('GPS write fail: ' + e.message));
-  }
-
-  // 2) compute + stream current nav step (new char)
-  if (route && navChar) {
-    const here = { lat: c.latitude, lon: c.longitude };
-
-    // advance past steps whose maneuver point we've passed (within 20 m)
-    while (stepIdx < route.steps.length - 1) {
-      const [mlon, mlat] = route.steps[stepIdx].maneuver.location;
-      if (haversine(here, { lat: mlat, lon: mlon }) < 20) stepIdx++;
-      else break;
+  // Skip if a previous write batch is still in flight (avoid pile-up).
+  if (writeBusy) return;
+  writeBusy = true;
+  try {
+    // 1) stream raw GPS (existing char)
+    if (gpsChar) {
+      const payload = `${c.latitude.toFixed(6)},${c.longitude.toFixed(6)},${speed.toFixed(2)},${heading.toFixed(1)},${acc.toFixed(1)}`;
+      try {
+        await gpsChar.writeValueWithoutResponse(new TextEncoder().encode(payload));
+        $('sent').textContent = ++sentCount;
+      } catch (e) {
+        setStatus('GPS write fail: ' + e.message);
+      }
     }
 
-    const step = route.steps[stepIdx];
-    const [mlon, mlat] = step.maneuver.location;
-    const distToNext = haversine(here, { lat: mlat, lon: mlon });
-    const { m, angle } = osrmToManeuver(step.maneuver.type, step.maneuver.modifier || '');
-    const street = step.name || step.maneuver.instruction || step.maneuver.type || '';
+    // 2) compute + stream current nav step (new char), throttled
+    if (route && navChar && (Date.now() - lastNavWrite >= NAV_MIN_INTERVAL_MS)) {
+      const here = { lat: c.latitude, lon: c.longitude };
 
-    // total remaining = distance to next maneuver + sum of subsequent step distances
-    let remaining = distToNext;
-    for (let i = stepIdx + 1; i < route.steps.length; i++) remaining += route.steps[i].distance;
-    const eta_min = Math.max(1, Math.round(remaining / 4.5 / 60));   // ~16 km/h cycling
+      // advance past steps whose maneuver point we've passed (within 20 m)
+      while (stepIdx < route.steps.length - 1) {
+        const [mlon, mlat] = route.steps[stepIdx].maneuver.location;
+        if (haversine(here, { lat: mlat, lon: mlon }) < 20) stepIdx++;
+        else break;
+      }
 
-    const pkt = packNav(m, angle, distToNext, eta_min, remaining, street);
-    navChar.writeValueWithoutResponse(pkt).catch(e => setStatus('nav write fail: ' + e.message));
+      const step = route.steps[stepIdx];
+      const [mlon, mlat] = step.maneuver.location;
+      const distToNext = haversine(here, { lat: mlat, lon: mlon });
+      const { m, angle } = osrmToManeuver(step.maneuver.type, step.maneuver.modifier || '');
+      const street = step.name || step.maneuver.instruction || step.maneuver.type || '';
 
-    $('route-next').textContent = `${street} - ${Math.round(distToNext)} m`;
+      let remaining = distToNext;
+      for (let i = stepIdx + 1; i < route.steps.length; i++) remaining += route.steps[i].distance;
+      const eta_min = Math.max(1, Math.round(remaining / 4.5 / 60));   // ~16 km/h cycling
+
+      // tiny breathing room between back-to-back writes on different characteristics
+      await new Promise(r => setTimeout(r, 30));
+
+      try {
+        // Wrap as Uint8Array for maximum compatibility across Chrome versions.
+        const pkt = new Uint8Array(packNav(m, angle, distToNext, eta_min, remaining, street));
+        await navChar.writeValueWithoutResponse(pkt);
+        lastNavWrite = Date.now();
+        $('route-next').textContent = `${street} - ${Math.round(distToNext)} m`;
+      } catch (e) {
+        setStatus('nav write fail: ' + e.message);
+      }
+    }
+  } finally {
+    writeBusy = false;
   }
 }
 
