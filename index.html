@@ -3,30 +3,59 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Phone GPS &rarr; ESP32</title>
+<title>BikeNav &mdash; Phone &rarr; ESP32</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; font-family: system-ui, sans-serif; background: #0b0f14; color: #e6edf3;
-         display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 28px 18px; }
-  h1 { font-size: 20px; margin: 4px 0 0; }
-  button { font-size: 17px; padding: 14px 22px; border: 0; border-radius: 12px;
-           background: #2f81f7; color: #fff; font-weight: 600; }
-  button:disabled { background: #30363d; color: #8b949e; }
-  #stop { background: #b62324; }
+         display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 24px 16px 80px; }
+  h1 { font-size: 19px; margin: 4px 0 0; }
+  button { font-size: 16px; padding: 12px 18px; border: 0; border-radius: 10px;
+           background: #2f81f7; color: #fff; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+  #stop, #clear-route { background: #b62324; }
+  input { font-size: 16px; padding: 12px 14px; border: 1px solid #30363d; background: #161b22;
+          color: #e6edf3; border-radius: 10px; width: 260px; max-width: 70vw; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
   .grid { width: 100%; max-width: 420px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 12px 14px; }
   .card .k { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .04em; }
   .card .v { font-size: 22px; font-variant-numeric: tabular-nums; margin-top: 4px; }
-  #status { font-size: 14px; color: #8b949e; min-height: 20px; text-align: center; }
+  #route-card { width: 100%; max-width: 420px; background: #0f2f1c; border: 1px solid #2ea043;
+                border-radius: 12px; padding: 14px; }
+  #route-card .label { font-size: 12px; color: #8b949e; text-transform: uppercase; }
+  #route-card .big { font-size: 22px; font-weight: 700; margin-top: 4px; }
+  #route-card .row2 { display: flex; gap: 16px; margin-top: 6px; color: #aeb6c0; font-variant-numeric: tabular-nums; }
+  #status { font-size: 14px; color: #8b949e; min-height: 20px; text-align: center; max-width: 100%; }
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: #b62324; }
   .dot.on { background: #2ea043; }
+  .muted { color: #8b949e; font-size: 12px; }
 </style>
 </head>
 <body>
-  <h1>Phone GPS &rarr; ESP32</h1>
-  <button id="connect">Connect to ESP32-GPS</button>
-  <button id="stop" hidden>Disconnect</button>
+  <h1>BikeNav</h1>
+
+  <div class="row">
+    <button id="connect">Connect to ESP32-GPS</button>
+    <button id="stop" hidden>Disconnect</button>
+  </div>
   <div id="status"><span class="dot" id="dot"></span><span id="statusText">Not connected. Tap Connect (Android Chrome).</span></div>
+
+  <div class="row" id="dest-row">
+    <input id="dest" placeholder="Where to? (e.g. Connaught Place, Delhi)" autocapitalize="words">
+    <button id="go">Go</button>
+    <button id="clear-route" hidden>Clear</button>
+  </div>
+
+  <div id="route-card" hidden>
+    <div class="label">To</div>
+    <div class="big" id="route-dest">&mdash;</div>
+    <div class="row2">
+      <div><span class="label">Distance</span> <div id="route-dist">&mdash;</div></div>
+      <div><span class="label">ETA</span> <div id="route-eta">&mdash;</div></div>
+    </div>
+    <div class="label" style="margin-top:10px">Next step</div>
+    <div id="route-next" style="margin-top:4px">&mdash;</div>
+  </div>
 
   <div class="grid">
     <div class="card"><div class="k">Speed</div><div class="v"><span id="speed">--</span> km/h</div></div>
@@ -37,79 +66,231 @@
     <div class="card"><div class="k">Sent</div><div class="v" id="sent">0</div></div>
   </div>
 
-<script>
-const SERVICE_UUID = 0xffe0;
-const CHAR_UUID    = 0xffe1;
+  <div class="muted">Routing: OSRM (open-source) &nbsp;&middot;&nbsp; Geocoding: Nominatim (OSM)</div>
 
-let characteristic = null;
+<script>
+// ---------- BLE constants (match GpsDisplay firmware) ----------
+const SERVICE_UUID  = 0xffe0;
+const CHAR_GPS_UUID = 0xffe1;   // CSV "lat,lon,speed,heading,acc"
+const CHAR_NAV_UUID = 0xffe2;   // binary nav packet (new in firmware v2)
+
+// ---------- maneuver enum (must match firmware) ----------
+const MAN = { CONTINUE:0, SLIGHT_L:1, LEFT:2, SHARP_L:3, SLIGHT_R:4, RIGHT:5, SHARP_R:6, UTURN:7, ARRIVE:8, ROUNDABOUT:9, DEPART:10 };
+
+// ---------- state ----------
+let gpsChar = null, navChar = null;
+let device = null;
 let watchId = null;
 let sentCount = 0;
+let route = null;        // { steps:[], distance, duration, destName }
+let stepIdx = 0;
 
 const $ = id => document.getElementById(id);
-function setStatus(text, ok=false) { $('statusText').textContent = text; $('dot').classList.toggle('on', ok); }
+const setStatus = (t, ok=false) => { $('statusText').textContent = t; $('dot').classList.toggle('on', ok); };
 
+// ---------- BLE connect ----------
 async function connect() {
-  if (!navigator.bluetooth) { setStatus('Web Bluetooth unavailable. Use Android Chrome over HTTPS.'); return; }
+  if (!navigator.bluetooth)   { setStatus('Web Bluetooth unavailable. Use Android Chrome over HTTPS.'); return; }
   if (!navigator.geolocation) { setStatus('Geolocation unavailable on this browser.'); return; }
   try {
     setStatus('Choosing device...');
-    const device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [SERVICE_UUID] }]
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID],
     });
     device.addEventListener('gattserverdisconnected', onDisconnected);
+
     setStatus('Connecting...');
-    const server = await device.gatt.connect();
+    const server  = await device.gatt.connect();
     const service = await server.getPrimaryService(SERVICE_UUID);
-    characteristic = await service.getCharacteristic(CHAR_UUID);
+    gpsChar = await service.getCharacteristic(CHAR_GPS_UUID);
+    try { navChar = await service.getCharacteristic(CHAR_NAV_UUID); }
+    catch { navChar = null; }                       // older firmware (no nav yet) is fine
 
     $('connect').hidden = true;
-    $('stop').hidden = false;
-    setStatus('Connected. Acquiring GPS...', true);
+    $('stop').hidden    = false;
+    setStatus(navChar ? 'Connected. Ready to navigate.' : 'Connected (firmware lacks nav char - GPS only).', true);
 
-    watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, {
-      enableHighAccuracy: true, maximumAge: 0, timeout: 15000
-    });
+    ensureWatching();
   } catch (e) {
     setStatus('Connect failed: ' + e.message);
   }
 }
 
-async function onPosition(pos) {
-  const c = pos.coords;
-  const speed   = (c.speed   == null || isNaN(c.speed))   ? 0  : c.speed;     // m/s
-  const heading = (c.heading == null || isNaN(c.heading)) ? -1 : c.heading;   // deg
+function onDisconnected() {
+  gpsChar = navChar = null;
+  if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  $('connect').hidden = false; $('stop').hidden = true;
+  setStatus('Disconnected.');
+}
+
+// ---------- destination + routing ----------
+async function geocode(query) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) throw new Error('geocoder ' + r.status);
+  const data = await r.json();
+  if (!data.length) throw new Error('Address not found');
+  return { lat: +data[0].lat, lon: +data[0].lon, name: data[0].display_name };
+}
+
+async function fetchRoute(from, to) {
+  // Public OSRM demo is most reliable on the 'driving' profile; usable for biking too.
+  const url = `https://router.project-osrm.org/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}`
+            + `?steps=true&overview=full&geometries=polyline&annotations=false`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('routing ' + r.status);
+  const data = await r.json();
+  if (data.code !== 'Ok' || !data.routes?.length) throw new Error('No route found');
+  return data.routes[0];
+}
+
+function getOneTimePosition() {
+  return new Promise((res, rej) =>
+    navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }));
+}
+
+async function go() {
+  const q = $('dest').value.trim();
+  if (!q) return;
+
+  setStatus('Looking up address...', true);
+  let dest, here;
+  try { dest = await geocode(q); }            catch (e) { setStatus('Geocode: ' + e.message); return; }
+  setStatus('Getting current position...', true);
+  try { here = await getOneTimePosition(); }  catch (e) { setStatus('GPS: ' + e.message); return; }
+  setStatus('Fetching route...', true);
+  let r;
+  try { r = await fetchRoute({lat: here.coords.latitude, lon: here.coords.longitude}, dest); }
+  catch (e) { setStatus('Routing: ' + e.message); return; }
+
+  const steps = [];
+  for (const leg of r.legs) for (const s of leg.steps) steps.push(s);
+  route = { steps, distance: r.distance, duration: r.duration, destName: dest.name };
+  stepIdx = 0;
+
+  $('route-card').hidden  = false;
+  $('clear-route').hidden = false;
+  $('route-dest').textContent = dest.name.split(',').slice(0, 2).join(',');
+  $('route-dist').textContent = (r.distance / 1000).toFixed(1) + ' km';
+  $('route-eta').textContent  = Math.round(r.duration / 60) + ' min';
+  setStatus(navChar ? 'Route loaded. Streaming nav to ESP32.' : 'Route loaded (no nav char on board - flash firmware v2).', true);
+
+  ensureWatching();
+}
+
+function clearRoute() {
+  route = null; stepIdx = 0;
+  $('route-card').hidden  = true;
+  $('clear-route').hidden = true;
+  $('route-next').textContent = '—';
+}
+
+// ---------- helpers ----------
+function haversine(a, b) {                       // meters between two {lat,lon}
+  const R = 6371000;
+  const φ1 = a.lat*Math.PI/180, φ2 = b.lat*Math.PI/180;
+  const dφ = (b.lat - a.lat)*Math.PI/180;
+  const dλ = (b.lon - a.lon)*Math.PI/180;
+  const x  = Math.sin(dφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(dλ/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+function osrmToManeuver(type, modifier) {        // OSRM step -> {m, angle}
+  if (type === 'arrive')                                                   return { m: MAN.ARRIVE,    angle: 0 };
+  if (type === 'depart')                                                   return { m: MAN.DEPART,    angle: 0 };
+  if (type === 'roundabout' || type === 'rotary' || type === 'exit roundabout') return { m: MAN.ROUNDABOUT, angle: 0 };
+  switch (modifier) {
+    case 'sharp left':   return { m: MAN.SHARP_L,  angle: -135 };
+    case 'left':         return { m: MAN.LEFT,     angle:  -90 };
+    case 'slight left':  return { m: MAN.SLIGHT_L, angle:  -30 };
+    case 'straight':     return { m: MAN.CONTINUE, angle:    0 };
+    case 'slight right': return { m: MAN.SLIGHT_R, angle:   30 };
+    case 'right':        return { m: MAN.RIGHT,    angle:   90 };
+    case 'sharp right':  return { m: MAN.SHARP_R,  angle:  135 };
+    case 'uturn':        return { m: MAN.UTURN,    angle:  180 };
+  }
+  return { m: MAN.CONTINUE, angle: 0 };
+}
+
+function packNav(m, angle, dist_m, eta_min, remaining_m, street) {
+  const sBytes = new TextEncoder().encode((street || '').slice(0, 40));
+  const buf = new ArrayBuffer(10 + sBytes.length);
+  const dv  = new DataView(buf);
+  dv.setUint8 (0, m & 0xff);
+  dv.setUint8 (1, 0);                                                       // units: 0 = metric
+  dv.setInt16 (2, Math.max(-32768, Math.min(32767, Math.round(angle))), true);
+  dv.setUint16(4, Math.min(65535, Math.max(0, Math.round(dist_m))),       true);
+  dv.setUint16(6, Math.min(65535, Math.max(0, Math.round(eta_min))),      true);
+  dv.setUint16(8, Math.min(65535, Math.max(0, Math.round(remaining_m))),  true);
+  new Uint8Array(buf, 10).set(sBytes);
+  return buf;
+}
+
+// ---------- live GPS + nav streaming ----------
+function ensureWatching() {
+  if (watchId != null) return;
+  watchId = navigator.geolocation.watchPosition(onPosition, onGeoError,
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+}
+
+function onPosition(pos) {
+  const c       = pos.coords;
+  const speed   = (c.speed   == null || isNaN(c.speed))   ? 0  : c.speed;
+  const heading = (c.heading == null || isNaN(c.heading)) ? -1 : c.heading;
   const acc     = c.accuracy || 0;
 
-  $('lat').textContent = c.latitude.toFixed(5);
-  $('lon').textContent = c.longitude.toFixed(5);
-  $('speed').textContent = (speed * 3.6).toFixed(0);
+  $('lat').textContent     = c.latitude.toFixed(5);
+  $('lon').textContent     = c.longitude.toFixed(5);
+  $('speed').textContent   = (speed * 3.6).toFixed(0);
   $('heading').textContent = heading < 0 ? '--' : heading.toFixed(0);
-  $('acc').textContent = acc.toFixed(0);
-  setStatus('Streaming GPS to ESP32', true);
+  $('acc').textContent     = acc.toFixed(0);
 
-  if (!characteristic) return;
-  const payload = `${c.latitude.toFixed(6)},${c.longitude.toFixed(6)},${speed.toFixed(2)},${heading.toFixed(1)},${acc.toFixed(1)}`;
-  try {
-    // writeValueWithoutResponse is fast and fine for a stream of fixes.
-    await characteristic.writeValueWithoutResponse(new TextEncoder().encode(payload));
-    $('sent').textContent = ++sentCount;
-  } catch (e) {
-    setStatus('Write failed: ' + e.message);
+  // 1) stream raw GPS (existing char)
+  if (gpsChar) {
+    const payload = `${c.latitude.toFixed(6)},${c.longitude.toFixed(6)},${speed.toFixed(2)},${heading.toFixed(1)},${acc.toFixed(1)}`;
+    gpsChar.writeValueWithoutResponse(new TextEncoder().encode(payload))
+           .then(() => $('sent').textContent = ++sentCount)
+           .catch(e => setStatus('GPS write fail: ' + e.message));
+  }
+
+  // 2) compute + stream current nav step (new char)
+  if (route && navChar) {
+    const here = { lat: c.latitude, lon: c.longitude };
+
+    // advance past steps whose maneuver point we've passed (within 20 m)
+    while (stepIdx < route.steps.length - 1) {
+      const [mlon, mlat] = route.steps[stepIdx].maneuver.location;
+      if (haversine(here, { lat: mlat, lon: mlon }) < 20) stepIdx++;
+      else break;
+    }
+
+    const step = route.steps[stepIdx];
+    const [mlon, mlat] = step.maneuver.location;
+    const distToNext = haversine(here, { lat: mlat, lon: mlon });
+    const { m, angle } = osrmToManeuver(step.maneuver.type, step.maneuver.modifier || '');
+    const street = step.name || step.maneuver.instruction || step.maneuver.type || '';
+
+    // total remaining = distance to next maneuver + sum of subsequent step distances
+    let remaining = distToNext;
+    for (let i = stepIdx + 1; i < route.steps.length; i++) remaining += route.steps[i].distance;
+    const eta_min = Math.max(1, Math.round(remaining / 4.5 / 60));   // ~16 km/h cycling
+
+    const pkt = packNav(m, angle, distToNext, eta_min, remaining, street);
+    navChar.writeValueWithoutResponse(pkt).catch(e => setStatus('nav write fail: ' + e.message));
+
+    $('route-next').textContent = `${street} - ${Math.round(distToNext)} m`;
   }
 }
 
 function onGeoError(e) { setStatus('GPS error: ' + e.message); }
 
-function onDisconnected() {
-  characteristic = null;
-  if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
-  $('connect').hidden = false;
-  $('stop').hidden = true;
-  setStatus('Disconnected.');
-}
-
+// ---------- wire up ----------
 $('connect').addEventListener('click', connect);
-$('stop').addEventListener('click', () => onDisconnected());
+$('stop').addEventListener('click', () => { if (device?.gatt?.connected) device.gatt.disconnect(); else onDisconnected(); });
+$('go').addEventListener('click', go);
+$('dest').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+$('clear-route').addEventListener('click', clearRoute);
 </script>
 </body>
 </html>
