@@ -449,9 +449,11 @@ async function sendPolylineFrames(pts, beginByte, pointsByte, endByte) {
     bd.setInt32(14, Math.round(loMin * 1e6), true);
     bd.setInt32(18, Math.round(loMax * 1e6), true);
     await navChar.writeValueWithoutResponse(new Uint8Array(begin));
-    await new Promise(r => setTimeout(r, 40));
+    await new Promise(r => setTimeout(r, 70));
 
-    const BATCH = 12;                       // 12 * 8 + 3 = 99 bytes per frame
+    // Bigger batch + longer gap = fewer total writes and more time between
+    // them, so Bluedroid's BTC_TASK on the ESP doesn't get backed up.
+    const BATCH = 16;                       // 16 * 8 + 3 = 131 bytes (still <= MTU)
     for (let i = 0; i < pts.length; i += BATCH) {
       const count = Math.min(BATCH, pts.length - i);
       const buf = new ArrayBuffer(3 + count * 8);
@@ -463,7 +465,7 @@ async function sendPolylineFrames(pts, beginByte, pointsByte, endByte) {
         dv.setInt32(3 + j * 8 + 4, Math.round(lo * 1e6), true);
       }
       await navChar.writeValueWithoutResponse(new Uint8Array(buf));
-      await new Promise(r => setTimeout(r, 35));
+      await new Promise(r => setTimeout(r, 60));
     }
 
     await navChar.writeValueWithoutResponse(new Uint8Array([0xFF, endByte]));
