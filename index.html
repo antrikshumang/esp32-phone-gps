@@ -25,6 +25,12 @@
   #route-card .label { font-size: 12px; color: #8b949e; text-transform: uppercase; }
   #route-card .big { font-size: 22px; font-weight: 700; margin-top: 4px; }
   #route-card .row2 { display: flex; gap: 16px; margin-top: 6px; color: #aeb6c0; font-variant-numeric: tabular-nums; }
+  #suggestions { width: 260px; max-width: 70vw; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 4px; }
+  .sug { padding: 9px 10px; border-radius: 6px; cursor: pointer; }
+  .sug:active, .sug.active { background: #22272e; }
+  .sug .name { font-size: 14px; color: #e6edf3; }
+  .sug .meta { font-size: 11px; color: #8b949e; margin-top: 2px; }
+  .sug .src  { font-size: 10px; color: #6e7681; float: right; margin-left: 8px; }
   #status { font-size: 14px; color: #8b949e; min-height: 20px; text-align: center; max-width: 100%; }
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: #b62324; }
   .dot.on { background: #2ea043; }
@@ -41,10 +47,11 @@
   <div id="status"><span class="dot" id="dot"></span><span id="statusText">Not connected. Tap Connect (Android Chrome).</span></div>
 
   <div class="row" id="dest-row">
-    <input id="dest" placeholder="Where to? (e.g. Connaught Place, Delhi)" autocapitalize="words">
+    <input id="dest" placeholder="Where to? (e.g. Connaught Place, Delhi)" autocapitalize="words" autocomplete="off">
     <button id="go">Go</button>
     <button id="clear-route" hidden>Clear</button>
   </div>
+  <div id="suggestions" hidden></div>
 
   <div id="route-card" hidden>
     <div class="label">To</div>
@@ -124,14 +131,140 @@ function onDisconnected() {
   setStatus('Disconnected.');
 }
 
-// ---------- destination + routing ----------
-async function geocode(query) {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
-  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
-  if (!r.ok) throw new Error('geocoder ' + r.status);
+// ---------- destination + autocomplete ----------
+// Photon (komoot) is built on OSM but optimised for autocomplete - much better
+// at partial / fuzzy matches than Nominatim. We bias by the user's last known
+// position so "Main St" prefers the nearby one. Nominatim is used as a fallback
+// when Photon returns nothing for a query.
+
+let lastKnownPos = null;       // [lat, lon] for biasing suggestions
+let selectedDest = null;       // user's chosen suggestion ({lat, lon, name, meta})
+let suggestTimer = null;
+let activeSuggestion = -1;
+
+function escapeHtml(s) {
+  return (s + '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+// Try to grab a position (one-shot) so we can bias suggestions. Cheap, low accuracy is fine.
+function primeLastKnownPos() {
+  if (!navigator.geolocation || lastKnownPos) return;
+  navigator.geolocation.getCurrentPosition(
+    p => { lastKnownPos = [p.coords.latitude, p.coords.longitude]; },
+    () => {}, { enableHighAccuracy: false, timeout: 6000, maximumAge: 300000 }
+  );
+}
+
+async function fetchPhotonSuggestions(q) {
+  const u = new URL('https://photon.komoot.io/api/');
+  u.searchParams.set('q', q);
+  u.searchParams.set('limit', '6');
+  if (lastKnownPos) {
+    u.searchParams.set('lat', lastKnownPos[0]);
+    u.searchParams.set('lon', lastKnownPos[1]);
+  }
+  u.searchParams.set('lang', 'en');
+  const r = await fetch(u);
+  if (!r.ok) throw new Error('photon ' + r.status);
   const data = await r.json();
-  if (!data.length) throw new Error('Address not found');
-  return { lat: +data[0].lat, lon: +data[0].lon, name: data[0].display_name };
+  return (data.features || []).map(f => {
+    const p = f.properties || {};
+    const [lon, lat] = f.geometry.coordinates;
+    const metaParts = [p.street, p.city || p.county || p.locality, p.state, p.country].filter(Boolean);
+    return {
+      lat, lon,
+      name: p.name || metaParts[0] || 'Place',
+      meta: [...new Set(metaParts.filter(x => x !== p.name))].join(', '),
+      src: 'photon',
+    };
+  });
+}
+
+async function fetchNominatimSuggestions(q) {
+  const u = new URL('https://nominatim.openstreetmap.org/search');
+  u.searchParams.set('format', 'json');
+  u.searchParams.set('q', q);
+  u.searchParams.set('limit', '6');
+  u.searchParams.set('addressdetails', '1');
+  if (lastKnownPos) {
+    const [la, lo] = lastKnownPos;
+    u.searchParams.set('viewbox', `${lo-0.5},${la-0.5},${lo+0.5},${la+0.5}`);
+    u.searchParams.set('bounded', '0');           // prefer, don't restrict
+  }
+  const r = await fetch(u, { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) throw new Error('nominatim ' + r.status);
+  const data = await r.json();
+  return data.map(d => {
+    const a = d.address || {};
+    const headline = a.amenity || a.tourism || a.shop || a.name || d.namedetails?.name || d.display_name.split(',')[0];
+    const meta = [a.city || a.town || a.village || a.county, a.state, a.country].filter(Boolean).join(', ');
+    return { lat: +d.lat, lon: +d.lon, name: headline, meta, src: 'osm' };
+  });
+}
+
+async function fetchSuggestions(q) {
+  // Photon first; if empty, fall through to Nominatim.
+  try {
+    const photon = await fetchPhotonSuggestions(q);
+    if (photon.length) return photon;
+  } catch {}
+  try {
+    return await fetchNominatimSuggestions(q);
+  } catch {
+    return [];
+  }
+}
+
+function renderSuggestions(items) {
+  const el = $('suggestions');
+  el.innerHTML = '';
+  activeSuggestion = -1;
+  if (!items.length) { el.hidden = true; return; }
+  el.hidden = false;
+  items.forEach((it, idx) => {
+    const div = document.createElement('div');
+    div.className = 'sug';
+    div.dataset.idx = idx;
+    div.innerHTML = `<span class="src">${escapeHtml(it.src)}</span>
+                     <div class="name">${escapeHtml(it.name)}</div>
+                     <div class="meta">${escapeHtml(it.meta)}</div>`;
+    div.addEventListener('click', () => selectSuggestion(it));
+    el.appendChild(div);
+  });
+  el._items = items;
+}
+
+function selectSuggestion(it) {
+  selectedDest = it;
+  $('dest').value = it.name + (it.meta ? `  (${it.meta})` : '');
+  renderSuggestions([]);
+}
+
+function onDestInput(e) {
+  const q = e.target.value.trim();
+  selectedDest = null;                    // typing invalidates any prior pick
+  if (suggestTimer) clearTimeout(suggestTimer);
+  if (q.length < 2) { renderSuggestions([]); return; }
+  suggestTimer = setTimeout(async () => {
+    primeLastKnownPos();
+    const items = await fetchSuggestions(q);
+    // If the user kept typing in the meantime, drop stale results.
+    if ($('dest').value.trim() !== q) return;
+    renderSuggestions(items);
+  }, 250);
+}
+
+// Dismiss suggestions on clicks outside the input/list.
+document.addEventListener('click', e => {
+  if (e.target.closest('#suggestions') || e.target.id === 'dest') return;
+  renderSuggestions([]);
+});
+
+// Resolve a typed query without an explicit pick. Returns same shape as a suggestion.
+async function resolveTyped(query) {
+  const items = await fetchSuggestions(query);
+  if (!items.length) throw new Error('Address not found');
+  return items[0];
 }
 
 async function fetchRoute(from, to) {
@@ -151,14 +284,21 @@ function getOneTimePosition() {
 }
 
 async function go() {
-  const q = $('dest').value.trim();
-  if (!q) return;
+  // Prefer an explicit pick from the suggestion list; fall back to resolving
+  // whatever text is in the box (Photon -> Nominatim chain).
+  let dest = selectedDest;
+  if (!dest) {
+    const q = $('dest').value.trim();
+    if (!q) return;
+    setStatus('Looking up address...', true);
+    try { dest = await resolveTyped(q); } catch (e) { setStatus('Address not found: ' + e.message); return; }
+  }
+  renderSuggestions([]);                  // close the dropdown if open
 
-  setStatus('Looking up address...', true);
-  let dest, here;
-  try { dest = await geocode(q); }            catch (e) { setStatus('Geocode: ' + e.message); return; }
+  let here;
   setStatus('Getting current position...', true);
   try { here = await getOneTimePosition(); }  catch (e) { setStatus('GPS: ' + e.message); return; }
+  lastKnownPos = [here.coords.latitude, here.coords.longitude];
   setStatus('Fetching route...', true);
   let r;
   try { r = await fetchRoute({lat: here.coords.latitude, lon: here.coords.longitude}, dest); }
@@ -171,7 +311,7 @@ async function go() {
 
   $('route-card').hidden  = false;
   $('clear-route').hidden = false;
-  $('route-dest').textContent = dest.name.split(',').slice(0, 2).join(',');
+  $('route-dest').textContent = dest.name + (dest.meta ? '  ·  ' + dest.meta.split(',')[0] : '');
   $('route-dist').textContent = (r.distance / 1000).toFixed(1) + ' km';
   $('route-eta').textContent  = Math.round(r.duration / 60) + ' min';
   setStatus(navChar ? 'Route loaded. Uploading polyline...' : 'Route loaded (no nav char on board - flash firmware v2).', true);
@@ -402,7 +542,9 @@ function onGeoError(e) { setStatus('GPS error: ' + e.message); }
 $('connect').addEventListener('click', connect);
 $('stop').addEventListener('click', () => { if (device?.gatt?.connected) device.gatt.disconnect(); else onDisconnected(); });
 $('go').addEventListener('click', go);
-$('dest').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+$('dest').addEventListener('input', onDestInput);
+$('dest').addEventListener('focus', primeLastKnownPos);
+$('dest').addEventListener('keydown', e => { if (e.key === 'Enter') { renderSuggestions([]); go(); } });
 $('clear-route').addEventListener('click', clearRoute);
 </script>
 </body>
